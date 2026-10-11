@@ -26,6 +26,15 @@ LOCATIONS = {
     "那覇 (沖縄)": {"lat": 26.2124, "lon": 127.6809},
 }
 
+# うるう年を考慮して「〇年前」の日付を計算する関数
+def safe_replace_year(date_obj, year_offset):
+    try:
+        return date_obj.replace(year=date_obj.year + year_offset)
+    except ValueError:
+        # うるう年の2/29で、移動先が平年の場合は2/28に調整
+        return date_obj.replace(year=date_obj.year + year_offset, day=28)
+
+
 # --- Open-Meteo Archive API からデータ取得 ---
 @st.cache_data(ttl=3600)
 def fetch_weather_data(lat: float, lon: float, start_date: datetime.date, end_date: datetime.date):
@@ -67,9 +76,20 @@ def fetch_weather_data(lat: float, lon: float, start_date: datetime.date, end_da
             return df
         else:
             return None
-    except Exception as e:
-        st.error(f"データ通信エラーが発生しました: {e}")
+    except Exception:
         return None
+
+
+# --- 指定期間のサマリー（合計・平均）を算出する関数 ---
+def calculate_summary(df):
+    if df is None or df.empty:
+        return None
+    return {
+        "precip": df["降水量 (mm)"].sum(),
+        "sun": df["日照時間 (時間)"].sum(),
+        "temp": df["平均気温 (°C)"].mean(),
+        "humid": df["平均湿度 (%)"].mean()
+    }
 
 
 # --- サイドバー (条件設定) ---
@@ -90,7 +110,6 @@ date_range = st.sidebar.date_input(
     max_value=max_allowed_date
 )
 
-# 日付選択のバリデーション
 if isinstance(date_range, tuple) and len(date_range) == 2:
     start_date, end_date = date_range
 else:
@@ -99,86 +118,111 @@ else:
 
 
 # --- メインコンテンツ ---
-st.title("🌤️ 過去気象データ分析アプリ")
+st.title("🌤️ 過去気象データ分析アプリ (過去比較付き)")
 st.caption(f"選択地域: **{selected_location}** （{start_date} ～ {end_date}）")
 
-with st.spinner("気象データを取得中..."):
-    df = fetch_weather_data(lat, lon, start_date, end_date)
+# データ取得・計算処理
+with st.spinner("指定期間、および過去5年分の気象データを取得・計算しています..."):
+    # 1. 指定期間（当年）
+    current_df = fetch_weather_data(lat, lon, start_date, end_date)
+    current_summary = calculate_summary(current_df)
 
-if df is None or df.empty:
-    st.error("指定された期間のデータを取得できませんでした。条件を変更してください。")
-    st.stop()
+    if current_df is None or current_df.empty:
+        st.error("指定された期間のデータを取得できませんでした。条件を変更してください。")
+        st.stop()
 
-# 期間日数の計算
-days_count = len(df)
+    # 2. 1年前の同期間
+    start_1yr = safe_replace_year(start_date, -1)
+    end_1yr = safe_replace_year(end_date, -1)
+    df_1yr = fetch_weather_data(lat, lon, start_1yr, end_1yr)
+    summary_1yr = calculate_summary(df_1yr)
 
-# --- 1. データサマリー (指標表示) ---
-st.subheader("📊 期間内の集計結果")
+    # 3. 過去5年間 (1〜5年前) の同期間平均
+    past_5_summaries = []
+    for i in range(1, 6):
+        s_date = safe_replace_year(start_date, -i)
+        e_date = safe_replace_year(end_date, -i)
+        df_i = fetch_weather_data(lat, lon, s_date, e_date)
+        sum_i = calculate_summary(df_i)
+        if sum_i:
+            past_5_summaries.append(sum_i)
+    
+    if past_5_summaries:
+        summary_5yr = {
+            "precip": sum(x["precip"] for x in past_5_summaries) / len(past_5_summaries),
+            "sun": sum(x["sun"] for x in past_5_summaries) / len(past_5_summaries),
+            "temp": sum(x["temp"] for x in past_5_summaries) / len(past_5_summaries),
+            "humid": sum(x["humid"] for x in past_5_summaries) / len(past_5_summaries)
+        }
+    else:
+        summary_5yr = None
+
+
+# --- 1. データサマリー (比較表示) ---
+st.subheader("📊 期間内の集計結果と過去比較")
+
+# UI描画用のヘルパー関数
+def render_metric(col, icon, label, key, unit):
+    val_current = current_summary[key]
+    val_1yr = summary_1yr[key] if summary_1yr else None
+    val_5yr = summary_5yr[key] if summary_5yr else None
+
+    with col:
+        # 1年前との差分表示
+        if val_1yr is not None:
+            delta_1yr = val_current - val_1yr
+            delta_str = f"昨年比: {delta_1yr:+.1f} {unit}"
+        else:
+            delta_str = "昨年データなし"
+
+        # メイン指標の描画 (delta_color="off" で色の意味付けをなくす)
+        st.metric(
+            label=f"{icon} {label}",
+            value=f"{val_current:.1f} {unit}",
+            delta=delta_str,
+            delta_color="off"
+        )
+        
+        # 過去5年平均との差分表示
+        if val_5yr is not None:
+            delta_5yr = val_current - val_5yr
+            st.caption(f"過去5年平均: {val_5yr:.1f} {unit}")
+            st.caption(f"（平均との差: {delta_5yr:+.1f} {unit}）")
+        else:
+            st.caption("過去5年平均データなし")
 
 col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    total_precip = df["降水量 (mm)"].sum()
-    avg_precip = df["降水量 (mm)"].mean()
-    st.metric(
-        label="🌧️ 降水量",
-        value=f"{total_precip:.1f} mm",
-        delta=f"日平均 {avg_precip:.1f} mm"
-    )
-
-with col2:
-    total_sun = df["日照時間 (時間)"].sum()
-    avg_sun = df["日照時間 (時間)"].mean()
-    st.metric(
-        label="☀️ 日照時間",
-        value=f"{total_sun:.1f} 時間",
-        delta=f"日平均 {avg_sun:.1f} 時間"
-    )
-
-with col3:
-    avg_temp = df["平均気温 (°C)"].mean()
-    max_temp = df["平均気温 (°C)"].max()
-    min_temp = df["平均気温 (°C)"].min()
-    st.metric(
-        label="🌡️ 期間平均気温",
-        value=f"{avg_temp:.1f} °C",
-        delta=f"最高 {max_temp:.1f} / 最低 {min_temp:.1f}"
-    )
-
-with col4:
-    avg_humidity = df["平均湿度 (%)"].mean()
-    st.metric(
-        label="💧 期間平均湿度",
-        value=f"{avg_humidity:.1f} %"
-    )
+render_metric(col1, "🌧️", "降水量 (合計)", "precip", "mm")
+render_metric(col2, "☀️", "日照時間 (合計)", "sun", "時間")
+render_metric(col3, "🌡️", "平均気温", "temp", "°C")
+render_metric(col4, "💧", "平均湿度", "humid", "%")
 
 st.divider()
 
-# --- 2. 日別推移グラフ ---
-st.subheader("📈 日別推移グラフ")
+# --- 2. 日別推移グラフ (指定期間) ---
+st.subheader("📈 指定期間の日別推移グラフ")
 
 tab1, tab2, tab3 = st.tabs(["気温・湿度", "降水量", "日照時間"])
 
 with tab1:
-    st.line_chart(df.set_index("日付")[["平均気温 (°C)", "平均湿度 (%)"]])
+    st.line_chart(current_df.set_index("日付")[["平均気温 (°C)", "平均湿度 (%)"]])
 
 with tab2:
-    st.bar_chart(df.set_index("日付")["降水量 (mm)"])
+    st.bar_chart(current_df.set_index("日付")["降水量 (mm)"])
 
 with tab3:
-    st.bar_chart(df.set_index("日付")["日照時間 (時間)"])
+    st.bar_chart(current_df.set_index("日付")["日照時間 (時間)"])
 
 st.divider()
 
 # --- 3. 詳細データテーブル & ダウンロード ---
 st.subheader("📋 詳細データ")
 
-st.dataframe(df, use_container_width=True)
+st.dataframe(current_df, use_container_width=True)
 
-# CSVダウンロード用リンク
-csv_data = df.to_csv(index=False).encode("utf-8-sig")
+csv_data = current_df.to_csv(index=False).encode("utf-8-sig")
 st.download_button(
-    label="📥 気象データをCSVダウンロード",
+    label="📥 指定期間のデータをCSVダウンロード",
     data=csv_data,
     file_name=f"weather_{selected_location}_{start_date}_{end_date}.csv",
     mime="text/csv"
